@@ -1,6 +1,8 @@
 defmodule OpenIDConnect.Worker do
   use GenServer
 
+  require Logger
+
   @moduledoc """
   Worker module for OpenID Connect
 
@@ -82,14 +84,18 @@ defmodule OpenIDConnect.Worker do
   end
 
   defp update_documents(provider, config) do
-    {:ok, %{remaining_lifetime: remaining_lifetime}} =
-      {:ok, documents} = OpenIDConnect.update_documents(config)
+    case OpenIDConnect.update_documents(config) do
+      {:ok, %{remaining_lifetime: remaining_lifetime} = documents} ->
+        refresh_time = time_until_next_refresh(remaining_lifetime)
+        Process.send_after(self(), {:update_documents, provider}, refresh_time)
+        documents
 
-    refresh_time = time_until_next_refresh(remaining_lifetime)
-
-    Process.send_after(self(), {:update_documents, provider}, refresh_time)
-
-    documents
+      {:error, reason, details} ->
+        Logger.error("Failed to update OIDC documents for #{provider}: #{inspect(reason)} - #{inspect(details)}")
+        # Retry after default refresh time - this provider won't work but others continue
+        Process.send_after(self(), {:update_documents, provider}, @refresh_time)
+        %{error: reason, error_details: details}
+    end
   end
 
   defp time_until_next_refresh(nil), do: @refresh_time

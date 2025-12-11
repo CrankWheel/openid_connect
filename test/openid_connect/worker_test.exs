@@ -105,16 +105,59 @@ defmodule OpenIDConnect.WorkerTest do
     assert expected_jwk == jwk
   end
 
-  test "worker can start without internet connectivity, initialization is deferred" do
+  test "worker continues running when a provider fails to fetch documents" do
     mock_http_internet_down()
 
     config = Application.get_env(:openid_connect, :providers)
-    {:error, :update_documents, _} = OpenIDConnect.update_documents(config)
 
-    config = Application.get_env(:openid_connect, :providers)
+    # Worker should start successfully even when HTTP requests fail
+    {:ok, pid} = start_supervised({OpenIDConnect.Worker, config})
+
+    # Worker should still be running and respond to calls
+    state = :sys.get_state(pid)
+
+    # The provider should have error state instead of documents
+    assert %{error: :update_documents} = get_in(state, [:google, :documents])
+  end
+
+  test "worker handles mixed success/failure across multiple providers" do
+    # First provider (google) succeeds, second provider (failing) fails
+    HTTPClientMock
+    |> expect(:get, fn "https://accounts.google.com/.well-known/openid-configuration", _headers, _opts ->
+      @google_document
+    end)
+    |> expect(:get, fn "https://www.googleapis.com/oauth2/v3/certs", _headers, _opts ->
+      @google_certs
+    end)
+    |> expect(:get, fn "https://failing.example.com/.well-known/openid-configuration", _headers, _opts ->
+      {:error, %HTTPoison.Error{id: nil, reason: :nxdomain}}
+    end)
+
+    config = [
+      google: Application.get_env(:openid_connect, :providers)[:google],
+      failing: [
+        discovery_document_uri: "https://failing.example.com/.well-known/openid-configuration",
+        client_id: "test",
+        client_secret: "test"
+      ]
+    ]
 
     {:ok, pid} = start_supervised({OpenIDConnect.Worker, config})
-    catch_exit(GenServer.call(pid, {:jwk, :google}))
+
+    state = :sys.get_state(pid)
+
+    # Google should have valid documents
+    expected_document =
+      @google_document
+      |> elem(1)
+      |> Map.get(:body)
+      |> Jason.decode!()
+      |> OpenIDConnect.normalize_discovery_document()
+
+    assert expected_document == get_in(state, [:google, :documents, :discovery_document])
+
+    # Failing provider should have error state
+    assert %{error: :update_documents} = get_in(state, [:failing, :documents])
   end
 
   defp mock_http_requests do
@@ -126,10 +169,8 @@ defmodule OpenIDConnect.WorkerTest do
   end
 
   defp mock_http_internet_down do
+    # Only one call expected - if discovery document fetch fails, certs won't be fetched
     HTTPClientMock
-    |> expect(:get, fn _, _, _ ->
-      {:error, %HTTPoison.Error{id: nil, reason: :nxdomain}}
-    end)
     |> expect(:get, fn _, _, _ ->
       {:error, %HTTPoison.Error{id: nil, reason: :nxdomain}}
     end)
